@@ -322,11 +322,20 @@ public final class OfflineDiarizerManager {
         }
 
         let reconstruction = OfflineReconstruction(config: config)
-        let segments = reconstruction.buildSegments(
+        var segments = reconstruction.buildSegments(
             segmentation: segmentation,
             hardClusters: chunkAssignments,
             centroids: centroids
         )
+
+        if config.shortSegmentRelabel.maxDurationSeconds > 0 {
+            segments = relabelShortSegments(
+                segments: segments,
+                centroids: centroids,
+                audioSource: audioSource,
+                models: models
+            )
+        }
 
         let speakerDatabase = reconstruction.buildSpeakerDatabase(segments: segments)
 
@@ -363,6 +372,98 @@ public final class OfflineDiarizerManager {
             chunkEmbeddings: publicChunkEmbeddings,
             timings: timings
         )
+    }
+
+    /// Short-segment re-embed + relabel post-pass.
+    ///
+    /// VBx frame clustering hands short interjections the surrounding dominant speaker's
+    /// label even when their boundaries are cut correctly. For every emitted segment with
+    /// duration ≤ `config.shortSegmentRelabel.maxDurationSeconds`, re-extract an embedding
+    /// over the segment's exact audio span and relabel it to the closest speaker centroid
+    /// when the cosine margin is decisive (`≥ minCosineMargin`).
+    ///
+    /// Deterministic: segments are visited in output order and centroids compared by index.
+    /// Any per-segment extraction failure (span too short for the model, NaN embedding)
+    /// silently keeps the original label — this pass never throws.
+    private func relabelShortSegments(
+        segments: [TimedSpeakerSegment],
+        centroids: [[Double]],
+        audioSource: AudioSampleSource,
+        models: OfflineDiarizerModels
+    ) -> [TimedSpeakerSegment] {
+        let relabelConfig = config.shortSegmentRelabel
+        guard relabelConfig.maxDurationSeconds > 0, centroids.count > 1, !segments.isEmpty else {
+            return segments
+        }
+
+        let extractor = OfflineEmbeddingExtractor(
+            fbankModel: models.fbankModel,
+            embeddingModel: models.embeddingModel,
+            pldaTransform: PLDATransform(pldaRhoModel: models.pldaRhoModel, psi: models.pldaPsi),
+            config: config
+        )
+
+        var output = segments
+        var relabeledCount = 0
+        var evaluatedCount = 0
+
+        for (index, segment) in segments.enumerated() {
+            let duration = Double(segment.durationSeconds)
+            guard duration > 0, duration <= relabelConfig.maxDurationSeconds else { continue }
+            guard
+                let currentCluster = ShortSegmentRelabeler.clusterIndex(
+                    fromSpeakerId: segment.speakerId),
+                centroids.indices.contains(currentCluster)
+            else { continue }
+
+            evaluatedCount += 1
+
+            let spanEmbedding: [Float]
+            do {
+                spanEmbedding = try extractor.embedSpan(
+                    audioSource: audioSource,
+                    startSeconds: Double(segment.startTimeSeconds),
+                    endSeconds: Double(segment.endTimeSeconds)
+                )
+            } catch {
+                // Span too short for the model / extraction failure — keep original label.
+                continue
+            }
+
+            guard
+                let decision = ShortSegmentRelabeler.decision(
+                    embedding: spanEmbedding.map(Double.init),
+                    centroids: centroids,
+                    currentCluster: currentCluster,
+                    minCosineMargin: relabelConfig.minCosineMargin
+                )
+            else { continue }
+
+            let newCentroid = centroids[decision.newCluster].map { Float($0) }
+            output[index] = TimedSpeakerSegment(
+                speakerId: "S\(decision.newCluster + 1)",
+                embedding: newCentroid,
+                startTimeSeconds: segment.startTimeSeconds,
+                endTimeSeconds: segment.endTimeSeconds,
+                qualityScore: segment.qualityScore
+            )
+            relabeledCount += 1
+
+            let startString = String(format: "%.2f", segment.startTimeSeconds)
+            let endString = String(format: "%.2f", segment.endTimeSeconds)
+            let marginString = String(format: "%.3f", decision.margin)
+            logger.info(
+                "Short-segment relabel [\(startString)s–\(endString)s]: S\(currentCluster + 1) → S\(decision.newCluster + 1) (cosine margin \(marginString))"
+            )
+        }
+
+        if evaluatedCount > 0 {
+            logger.debug(
+                "Short-segment relabel pass evaluated \(evaluatedCount) segments, relabeled \(relabeledCount)"
+            )
+        }
+
+        return output
     }
 
     /// Map the internal `[TimedEmbedding] + assignments` pair to the public

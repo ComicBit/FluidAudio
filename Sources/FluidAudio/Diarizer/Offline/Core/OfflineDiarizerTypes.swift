@@ -199,6 +199,31 @@ public struct OfflineDiarizerConfig: Sendable {
         }
     }
 
+    /// Optional post-pass that re-embeds short segments over their exact audio span and
+    /// relabels them to the closest speaker centroid when the cosine margin is decisive.
+    ///
+    /// VBx frame-level clustering tends to hand short interjections (0.5–2 s) the label of
+    /// the surrounding dominant speaker even when segmentation cuts them correctly. This
+    /// pass fixes that inside the pipeline, where the raw audio and the real per-speaker
+    /// centroids are still available.
+    public struct ShortSegmentRelabel: Sendable {
+        /// Maximum duration (seconds) of a segment eligible for re-embed + relabel.
+        /// `0` disables the post-pass entirely (default — upstream behavior unchanged).
+        public var maxDurationSeconds: Double
+
+        /// Minimum cosine-similarity margin (best centroid − current centroid) required
+        /// before a segment is relabeled. Guards against flip-flopping on noisy spans.
+        public var minCosineMargin: Double
+
+        /// Post-pass disabled (FluidAudio default).
+        public static let disabled = ShortSegmentRelabel(maxDurationSeconds: 0)
+
+        public init(maxDurationSeconds: Double = 0, minCosineMargin: Double = 0.10) {
+            self.maxDurationSeconds = maxDurationSeconds
+            self.minCosineMargin = minCosineMargin
+        }
+    }
+
     public struct Export: Sendable {
         public var embeddingsPath: String?
 
@@ -214,6 +239,7 @@ public struct OfflineDiarizerConfig: Sendable {
     public var clustering: Clustering
     public var vbx: VBx
     public var postProcessing: PostProcessing
+    public var shortSegmentRelabel: ShortSegmentRelabel
     public var export: Export
 
     /// When true, populate `DiarizationResult.chunkEmbeddings` with per-chunk
@@ -228,6 +254,7 @@ public struct OfflineDiarizerConfig: Sendable {
         clustering: Clustering = .community,
         vbx: VBx = .community,
         postProcessing: PostProcessing = .community,
+        shortSegmentRelabel: ShortSegmentRelabel = .disabled,
         export: Export = .none,
         exposeChunkEmbeddings: Bool = false
     ) {
@@ -236,6 +263,7 @@ public struct OfflineDiarizerConfig: Sendable {
         self.clustering = clustering
         self.vbx = vbx
         self.postProcessing = postProcessing
+        self.shortSegmentRelabel = shortSegmentRelabel
         self.export = export
         self.exposeChunkEmbeddings = exposeChunkEmbeddings
     }
@@ -365,6 +393,18 @@ public struct OfflineDiarizerConfig: Sendable {
         guard postProcessing.minGapDurationSeconds >= 0 else {
             throw OfflineDiarizationError.invalidConfiguration(
                 "minGapDuration must be >= 0"
+            )
+        }
+
+        guard shortSegmentRelabel.maxDurationSeconds >= 0 else {
+            throw OfflineDiarizationError.invalidConfiguration(
+                "shortSegmentRelabel.maxDurationSeconds must be >= 0, got \(shortSegmentRelabel.maxDurationSeconds)"
+            )
+        }
+
+        guard shortSegmentRelabel.minCosineMargin >= 0 else {
+            throw OfflineDiarizationError.invalidConfiguration(
+                "shortSegmentRelabel.minCosineMargin must be >= 0, got \(shortSegmentRelabel.minCosineMargin)"
             )
         }
 
