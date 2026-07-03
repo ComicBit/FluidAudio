@@ -224,6 +224,32 @@ public struct OfflineDiarizerConfig: Sendable {
         }
     }
 
+    /// Optional post-pass that re-embeds aggregated timeline spans whose per-cluster vote
+    /// sums are all zero and assigns them to the closest speaker centroid.
+    ///
+    /// A frame ends up with zero votes when the active local speaker slot received no
+    /// embedding in any covering window (assignment −2 everywhere). Reconstruction would
+    /// otherwise tie-break such frames arbitrarily to cluster 0, silently absorbing whole
+    /// speaker turns into the surrounding speaker's segment. Since zero votes means there
+    /// is no incumbent evidence at all, the re-embedded span is assigned to the best
+    /// centroid regardless of margin.
+    public struct ZeroVoteReembed: Sendable {
+        /// Whether the post-pass runs. `false` by default — upstream behavior unchanged.
+        public var enabled: Bool
+
+        /// Minimum duration (seconds) of a contiguous zero-vote run eligible for re-embed.
+        /// Shorter runs keep the existing tie-break behavior.
+        public var minDurationSeconds: Double
+
+        /// Post-pass disabled (FluidAudio default).
+        public static let disabled = ZeroVoteReembed()
+
+        public init(enabled: Bool = false, minDurationSeconds: Double = 0.4) {
+            self.enabled = enabled
+            self.minDurationSeconds = minDurationSeconds
+        }
+    }
+
     public struct Export: Sendable {
         public var embeddingsPath: String?
 
@@ -240,6 +266,7 @@ public struct OfflineDiarizerConfig: Sendable {
     public var vbx: VBx
     public var postProcessing: PostProcessing
     public var shortSegmentRelabel: ShortSegmentRelabel
+    public var zeroVoteReembed: ZeroVoteReembed
     public var export: Export
 
     /// When true, populate `DiarizationResult.chunkEmbeddings` with per-chunk
@@ -255,6 +282,7 @@ public struct OfflineDiarizerConfig: Sendable {
         vbx: VBx = .community,
         postProcessing: PostProcessing = .community,
         shortSegmentRelabel: ShortSegmentRelabel = .disabled,
+        zeroVoteReembed: ZeroVoteReembed = .disabled,
         export: Export = .none,
         exposeChunkEmbeddings: Bool = false
     ) {
@@ -264,6 +292,7 @@ public struct OfflineDiarizerConfig: Sendable {
         self.vbx = vbx
         self.postProcessing = postProcessing
         self.shortSegmentRelabel = shortSegmentRelabel
+        self.zeroVoteReembed = zeroVoteReembed
         self.export = export
         self.exposeChunkEmbeddings = exposeChunkEmbeddings
     }
@@ -405,6 +434,12 @@ public struct OfflineDiarizerConfig: Sendable {
         guard shortSegmentRelabel.minCosineMargin >= 0 else {
             throw OfflineDiarizationError.invalidConfiguration(
                 "shortSegmentRelabel.minCosineMargin must be >= 0, got \(shortSegmentRelabel.minCosineMargin)"
+            )
+        }
+
+        guard zeroVoteReembed.minDurationSeconds >= 0 else {
+            throw OfflineDiarizationError.invalidConfiguration(
+                "zeroVoteReembed.minDurationSeconds must be >= 0, got \(zeroVoteReembed.minDurationSeconds)"
             )
         }
 
