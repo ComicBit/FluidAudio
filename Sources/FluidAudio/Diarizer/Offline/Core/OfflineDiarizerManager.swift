@@ -337,6 +337,18 @@ public final class OfflineDiarizerManager {
             )
         }
 
+        if OfflinePosteriorDump.isEnabled {
+            dumpPosteriorStudy(
+                segmentation: segmentation,
+                timedEmbeddings: timedEmbeddings,
+                trainingIndices: trainingIndices,
+                assignments: assignments,
+                vbxOutput: vbxOutput,
+                chunkAssignments: chunkAssignments,
+                finalSegments: segments
+            )
+        }
+
         let speakerDatabase = reconstruction.buildSpeakerDatabase(segments: segments)
 
         if let exportPath = config.embeddingExportPath {
@@ -372,6 +384,84 @@ public final class OfflineDiarizerManager {
             chunkEmbeddings: publicChunkEmbeddings,
             timings: timings
         )
+    }
+
+    /// Debug-only posterior study dump, gated on FLUID_OFFLINE_POSTERIOR_DUMP.
+    /// Writes raw per-window powerset activations (study ranges only), per-embedding
+    /// VBx assignments/gamma, the chunk assignment matrix, and the final segments.
+    private func dumpPosteriorStudy(
+        segmentation: SegmentationOutput,
+        timedEmbeddings: [TimedEmbedding],
+        trainingIndices: [Int],
+        assignments: [Int],
+        vbxOutput: VBxOutput,
+        chunkAssignments: [[Int]],
+        finalSegments: [TimedSpeakerSegment]
+    ) {
+        // Raw per-window binary activations for windows overlapping the study ranges.
+        var windowObjects: [[String: Any]] = []
+        for chunkIndex in 0..<segmentation.numChunks {
+            let offset =
+                segmentation.chunkOffsets.indices.contains(chunkIndex)
+                ? segmentation.chunkOffsets[chunkIndex]
+                : Double(chunkIndex) * config.windowDuration
+            let end = offset + config.windowDuration
+            guard OfflinePosteriorDump.overlapsDumpRange(start: offset, end: end) else { continue }
+            guard chunkIndex < segmentation.speakerWeights.count else { continue }
+            let activations = segmentation.speakerWeights[chunkIndex].map { frame in
+                frame.map { Int($0.rounded()) }
+            }
+            windowObjects.append([
+                "chunk": chunkIndex,
+                "offset_s": OfflinePosteriorDump.round4(offset),
+                "frame_duration": segmentation.frameDuration,
+                "activations": activations,
+            ])
+        }
+        OfflinePosteriorDump.writeJSONL(windowObjects, to: "windows.jsonl")
+
+        // Per-embedding cluster assignment + VBx gamma (gamma rows follow trainingIndices order).
+        var gammaByEmbeddingIndex: [Int: [Double]] = [:]
+        for (row, embeddingIndex) in trainingIndices.enumerated() where row < vbxOutput.gamma.count {
+            gammaByEmbeddingIndex[embeddingIndex] = vbxOutput.gamma[row]
+        }
+        var embeddingObjects: [[String: Any]] = []
+        embeddingObjects.reserveCapacity(timedEmbeddings.count)
+        for (index, embedding) in timedEmbeddings.enumerated() {
+            var object: [String: Any] = [
+                "index": index,
+                "chunk": embedding.chunkIndex,
+                "speaker_index": embedding.speakerIndex,
+                "start": OfflinePosteriorDump.round4(embedding.startTime),
+                "end": OfflinePosteriorDump.round4(embedding.endTime),
+                "assignment": index < assignments.count ? assignments[index] : -1,
+            ]
+            if let gamma = gammaByEmbeddingIndex[index],
+                let best = gamma.enumerated().max(by: { $0.element < $1.element })
+            {
+                object["vbx_best"] = best.offset
+                object["vbx_gamma_max"] = OfflinePosteriorDump.round4(best.element)
+            }
+            embeddingObjects.append(object)
+        }
+        OfflinePosteriorDump.writeJSONL(embeddingObjects, to: "embeddings.jsonl")
+
+        // Chunk → (local speaker → cluster) assignment matrix.
+        let assignmentObjects: [[String: Any]] = chunkAssignments.enumerated().map {
+            chunkIndex, row in
+            ["chunk": chunkIndex, "clusters": row]
+        }
+        OfflinePosteriorDump.writeJSONL(assignmentObjects, to: "chunk_assignments.jsonl")
+
+        // Final emitted segments (post short-segment relabel).
+        let segmentObjects: [[String: Any]] = finalSegments.map { segment in
+            [
+                "speaker": segment.speakerId,
+                "start": OfflinePosteriorDump.round4(Double(segment.startTimeSeconds)),
+                "end": OfflinePosteriorDump.round4(Double(segment.endTimeSeconds)),
+            ]
+        }
+        OfflinePosteriorDump.writeJSONL(segmentObjects, to: "segments_final.jsonl")
     }
 
     /// Short-segment re-embed + relabel post-pass.

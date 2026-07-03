@@ -216,7 +216,64 @@ struct OfflineReconstruction {
         }
 
         let merged = mergeSegments(rawSegments, gapThreshold: gapThreshold)
-        return sanitize(segments: merged)
+        let output = sanitize(segments: merged)
+
+        if OfflinePosteriorDump.isEnabled {
+            dumpFrameTimeline(
+                totalFrames: totalFrames,
+                frameDuration: frameDuration,
+                activationSums: activationSums,
+                activationCounts: activationCounts,
+                expectedCountSums: expectedCountSums,
+                expectedCountWeights: expectedCountWeights,
+                speakerCountPerFrame: speakerCountPerFrame,
+                perFrameClusters: perFrameClusters
+            )
+            dumpSegments(rawSegments, to: "recon_segments_raw.jsonl")
+            dumpSegments(output, to: "recon_segments_out.jsonl")
+        }
+
+        return output
+    }
+
+    /// Debug-only dump of the aggregated global frame timeline (post-window-aggregation,
+    /// post cluster assignment). No-op unless FLUID_OFFLINE_POSTERIOR_DUMP is set.
+    private func dumpFrameTimeline(
+        totalFrames: Int,
+        frameDuration: Double,
+        activationSums: [[Double]],
+        activationCounts: [[Double]],
+        expectedCountSums: [Double],
+        expectedCountWeights: [Double],
+        speakerCountPerFrame: [Int],
+        perFrameClusters: [[Int]]
+    ) {
+        var objects: [[String: Any]] = []
+        objects.reserveCapacity(totalFrames)
+        for frame in 0..<totalFrames {
+            let weight = expectedCountWeights[frame]
+            objects.append([
+                "t": OfflinePosteriorDump.round4(Double(frame) * frameDuration),
+                "sums": activationSums[frame].map(OfflinePosteriorDump.round4),
+                "counts": activationCounts[frame].map { Int($0) },
+                "expected": weight > 0
+                    ? OfflinePosteriorDump.round4(expectedCountSums[frame] / weight) : 0,
+                "speaker_count": speakerCountPerFrame[frame],
+                "selected": perFrameClusters[frame],
+            ])
+        }
+        OfflinePosteriorDump.writeJSONL(objects, to: "recon_frames.jsonl")
+    }
+
+    private func dumpSegments(_ segments: [TimedSpeakerSegment], to fileName: String) {
+        let objects: [[String: Any]] = segments.map { segment in
+            [
+                "speaker": segment.speakerId,
+                "start": OfflinePosteriorDump.round4(Double(segment.startTimeSeconds)),
+                "end": OfflinePosteriorDump.round4(Double(segment.endTimeSeconds)),
+            ]
+        }
+        OfflinePosteriorDump.writeJSONL(objects, to: fileName)
     }
 
     func buildSpeakerDatabase(
