@@ -256,7 +256,11 @@ struct OfflineEmbeddingExtractor {
 
         var buffer = [Float](repeating: 0, count: config.samplesPerWindow)
         try buffer.withUnsafeMutableBufferPointer { pointer in
-            guard let baseAddress = pointer.baseAddress else { return }
+            guard let baseAddress = pointer.baseAddress else {
+                throw OfflineDiarizationError.processingFailed(
+                    "embedSpan: failed to access span buffer"
+                )
+            }
             try audioSource.copySamples(
                 into: baseAddress,
                 offset: startSample,
